@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -328,7 +329,13 @@ async def entrypoint(ctx: JobContext):
 
     agent_config = openvidu_agent.get_agent_config()
 
-    transcriber = MultiUserTranscriber(ctx, agent_config)
+    # Per-room overrides arrive as a JSON string in the dispatch `metadata` field.
+    # Build a per-job config view so the singleton agent_config is never mutated.
+    per_job_config = _build_per_job_config(
+        agent_config, ctx.job.metadata
+    )
+
+    transcriber = MultiUserTranscriber(ctx, per_job_config)
     transcriber.start()
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -412,6 +419,69 @@ async def entrypoint(ctx: JobContext):
 #             asyncio.create_task(transcribe_track(participant, track))
 
 #     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+
+def _parse_job_metadata(raw):
+    """Parse dispatch metadata into a flat override dict.
+
+    Returns an empty dict on missing or invalid input. Bad input is logged at
+    WARNING level so operators can see the misformed payload, but the session
+    is allowed to continue with YAML defaults.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logging.warning(f"Ignoring unparseable job metadata: {e}")
+        return {}
+    if not isinstance(parsed, dict):
+        logging.warning(
+            f"Ignoring job metadata: expected JSON object, got {type(parsed).__name__}"
+        )
+        return {}
+
+    out: dict = {}
+    lang = parsed.get("language")
+    if lang is None:
+        return out
+    if isinstance(lang, str) and lang:
+        out["language"] = lang
+    elif isinstance(lang, list) and lang and all(
+        isinstance(x, str) and x for x in lang
+    ):
+        out["language"] = lang
+    else:
+        logging.warning(
+            f"Ignoring job metadata 'language': must be non-empty string "
+            f"or list of strings, got {lang!r}"
+        )
+    if "language" in out:
+        logging.info(f"Using language from job metadata: {out['language']!r}")
+    return out
+
+
+def _build_per_job_config(agent_config, job_metadata):
+    """Return a per-job copy of agent_config with overrides applied from
+    dispatch metadata. Never mutates agent_config.
+
+    Currently only the Azure provider's `language` key can be overridden;
+    other overrides can be added by extending _parse_job_metadata and the
+    branching here in tandem.
+    """
+    override = _parse_job_metadata(job_metadata)
+    if not override:
+        # Identity return is intentional: callers must not mutate the result.
+        return agent_config
+
+    per_job = dict(agent_config)
+    per_job["live_captions"] = dict(agent_config.get("live_captions", {}))
+    per_job["live_captions"]["azure"] = dict(
+        per_job["live_captions"].get("azure", {})
+    )
+    if "language" in override:
+        per_job["live_captions"]["azure"]["language"] = override["language"]
+    return per_job
 
 
 def prewarm(proc: JobProcess):

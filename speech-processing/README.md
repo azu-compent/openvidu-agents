@@ -192,3 +192,141 @@ Supported providers: assemblyai, aws, azure, ...
 ### Example: Real Implementation
 
 See any existing provider like `get_aws_stt_impl()`, `get_openai_stt_impl()`, etc. for complete examples.
+
+## Per-room language override (Azure)
+
+When the agent is dispatched in **manual** mode
+(`live_captions.processing: manual`), the dispatching application can override
+`live_captions.azure.language` per room by passing a JSON object in the
+LiveKit Agent Dispatch `metadata` field.
+
+### Metadata contract
+
+The `metadata` string must parse as a JSON object. The agent reads the
+`language` key and ignores everything else.
+
+| Value of `language` | Effect |
+|---|---|
+| Non-empty string (e.g. `"es-ES"`) | Override Azure STT with this language. |
+| Non-empty list of strings (e.g. `["en-US", "es-ES"]`) | Override with this candidate list (Azure auto-detects within it). |
+| Missing, `null`, or omitted entirely | Fall back to `live_captions.azure.language` from the YAML. |
+| Any other type, empty string, or empty list | Logged as a warning and treated as if `language` were omitted. |
+
+Invalid JSON in `metadata` is also treated as omitted (logged as a warning).
+The session always starts; metadata is purely additive.
+
+### Example
+
+Python backend (using `livekit-api`):
+
+```python
+from livekit import api
+
+dispatch = await lk_api.agent_dispatch.create_dispatch(
+    api.CreateAgentDispatchRequest(
+        agent_name="speech-processing",
+        room="room-123",
+        metadata='{"language": "es-ES"}',
+    )
+)
+```
+
+### Scope
+
+Only the Azure provider's `language` is overridable today. Other providers
+and other config keys still come exclusively from the YAML. See the
+[`live_captions.azure.language` reference](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=stt#supported-languages)
+for valid Azure language codes.
+
+## Building & publishing the cloud image to your own Docker Hub
+
+This is the exact flow for building the **cloud** STT image from this fork and
+publishing it under your own Docker Hub account. The cloud image is built in two
+stages: a shared `base` image, then the `cloud` image on top of it.
+
+Replace these two values with your own throughout:
+
+| Placeholder | Example used below |
+|---|---|
+| `<DOCKER_USER>` — your Docker Hub username | `azucompent` |
+| `<TAG>` — the image tag you want to publish | `3.7.0` |
+
+All commands are run from the `speech-processing/` directory:
+
+```bash
+cd speech-processing
+```
+
+### Step 1 — Log in to Docker Hub
+
+```bash
+docker login
+```
+
+### Step 2 — Build the base image (local only, not pushed)
+
+The base image is the parent of the cloud image. It gets baked into the cloud
+image's layers, so it does **not** need to be pushed — building it locally is
+enough.
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --load \
+  -f Dockerfile.base \
+  -t azucompent/agent-speech-processing-base:3.7.0 \
+  .
+```
+
+### Step 3 — Build the cloud image on top of your base
+
+The cloud Dockerfile defaults its `BASE_IMAGE` to the upstream
+`openvidu/agent-speech-processing-base:main`. Override it with `--build-arg` so
+it builds on the base you just made:
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --load \
+  -f Dockerfile.cloud \
+  --build-arg BASE_IMAGE=azucompent/agent-speech-processing-base:3.7.0 \
+  -t azucompent/agent-speech-processing-cloud:3.7.0 \
+  .
+```
+
+### Step 4 — Push the cloud image
+
+```bash
+docker push azucompent/agent-speech-processing-cloud:3.7.0
+```
+
+Then pull/deploy it with:
+
+```bash
+docker pull azucompent/agent-speech-processing-cloud:3.7.0
+```
+
+### Notes
+
+- **Architecture:** the commands above build for `linux/amd64` only. To produce a
+  multi-arch image (e.g. for ARM servers like AWS Graviton or Apple Silicon),
+  build and push in one step with buildx instead of `--load`:
+
+  ```bash
+  docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -f Dockerfile.cloud \
+    --build-arg BASE_IMAGE=azucompent/agent-speech-processing-base:3.7.0 \
+    -t azucompent/agent-speech-processing-cloud:3.7.0 \
+    --push \
+    .
+  ```
+
+  Multi-arch images cannot be `--load`ed into the local Docker daemon; they must
+  be pushed directly. The base image would also need a multi-arch build in that
+  case.
+- **Transient push errors:** `docker push` is idempotent — if it fails partway
+  with `unexpected EOF` or a daemon-connection error, just rerun the same push
+  command. Already-uploaded layers report `Layer already exists` and are skipped.
+- **Vosk (offline) images** are built separately via `./build-vosk.sh` (run
+  `./download-models.sh` first). See that script's `--help` for options.
